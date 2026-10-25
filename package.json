@@ -1,0 +1,23 @@
+{
+  "name": "dsh-wechat-bridge",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "native-context.mjs",
+  "exports": {
+    ".": "./native-context.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "slots"
+      ],
+      "platform": "web"
+    },
+    "bundle": {
+      "patch": "./dsh.bundle.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+# 本地配置（含 hookToken / decryptKey，绝不能提交）
+config.json
+!config.example.json
+
+# 运行时数据
+runtime/
+workspace/
+logs/
+dist/
+build/
+toolchain/
+tools/
+vendor/
+_scratch/
+node_modules/
+__pycache__/
+
+# 日志与备份
+*.log
+*.err
+*.out
+*.bak*
+_tmp_*

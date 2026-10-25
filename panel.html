@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DSH × 微信 桥接面板</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0f1115; color: #e6e8ee; }
+  header { padding: 16px 22px; border-bottom: 1px solid #23262e; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .tag { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #20242d; color: #9aa4b2; }
+  .ok { background: #13381f; color: #5ee38a; }
+  .bad { background: #3a1a1c; color: #ff8a8a; }
+  main { padding: 18px 22px; display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  section { background: #151922; border: 1px solid #23262e; border-radius: 12px; padding: 14px 16px; }
+  section h2 { font-size: 13px; margin: 0 0 10px; color: #9aa4b2; font-weight: 600; letter-spacing: .04em; }
+  label { display: block; font-size: 12px; color: #9aa4b2; margin: 8px 0 4px; }
+  input, textarea, button { font: inherit; }
+  input[type=text], textarea { width: 100%; background: #0e1117; color: #e6e8ee; border: 1px solid #2a2f3a; border-radius: 8px; padding: 8px 10px; }
+  textarea { min-height: 92px; resize: vertical; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  button { background: #2a6df6; color: #fff; border: 0; border-radius: 8px; padding: 7px 14px; cursor: pointer; }
+  button.ghost { background: #232833; color: #cfd6e4; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  pre { background: #0b0e13; border: 1px solid #23262e; border-radius: 8px; padding: 10px; margin: 0; max-height: 260px; overflow: auto; font: 12px/1.5 ui-monospace, Consolas, monospace; color: #b9c2d0; white-space: pre-wrap; word-break: break-all; }
+  .kv { display: grid; grid-template-columns: 96px 1fr; gap: 4px 10px; font-size: 13px; }
+  .kv span:nth-child(odd) { color: #7c8798; }
+  .hint { font-size: 12px; color: #7c8798; margin-top: 6px; }
+  #toast { position: fixed; right: 18px; bottom: 18px; background: #232833; border: 1px solid #2f3644; padding: 10px 14px; border-radius: 10px; opacity: 0; transition: opacity .2s; font-size: 13px; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>DSH × 微信 桥接</h1>
+  <span id="readerTag" class="tag">reader …</span>
+  <span id="hookTag" class="tag">hook …</span>
+  <span id="pauseTag" class="tag">…</span>
+  <span style="flex:1"></span>
+  <button class="ghost" id="btnPause">暂停转发</button>
+  <button class="ghost" id="btnRefresh">刷新</button>
+</header>
+
+<main>
+  <section>
+    <h2>状态</h2>
+    <div class="kv" id="status"></div>
+    <div class="hint">reader 断开一般是因为 WeChatAgent 里对应会话被取消选中，或它没在运行。</div>
+  </section>
+
+  <section>
+    <h2>转发白名单（一行一个 username）</h2>
+    <textarea id="allow" spellcheck="false"></textarea>
+    <div class="row">
+      <button id="btnSaveAllow">保存白名单</button>
+      <button class="ghost" id="btnSessions">读取会话列表</button>
+    </div>
+    <div class="hint">群聊 username 形如 12345678@chatroom，私聊形如 wxid_xxx。填 * 表示全部。</div>
+    <pre id="sessions" style="margin-top:10px; max-height:180px"></pre>
+  </section>
+
+  <section>
+    <h2>测试发送</h2>
+    <label>talker（username）</label>
+    <input type="text" id="testTalker" placeholder="wxid_xxx 或 xxx@chatroom" />
+    <label>文本</label>
+    <input type="text" id="testText" value="桥接测试：面板直发" />
+    <div class="row">
+      <button id="btnTestText">发文本</button>
+    </div>
+    <label>图片路径（png/jpg/webp 会自动转 GIF）</label>
+    <input type="text" id="testImage" value="D:/APP/AI/DSH-WeChat-Bridge/workspace/screenshot_test.png" />
+    <div class="row">
+      <button id="btnTestImage">发图片</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>DSH 侧配置</h2>
+    <label>agentPreset</label>
+    <input type="text" id="cfgPreset" />
+    <label>provider / model</label>
+    <div class="row" style="margin-top:0">
+      <input type="text" id="cfgProvider" style="flex:1" placeholder="trae" />
+      <input type="text" id="cfgModel" style="flex:1" placeholder="DeepSeek-V4-Flash" />
+    </div>
+    <div class="row">
+      <button id="btnSaveAgent">保存</button>
+    </div>
+    <div class="hint">改动要重启 DSH 才生效（插件读取的是启动时的配置）。</div>
+  </section>
+
+  <section style="grid-column: 1 / -1">
+    <h2>日志（最近 200 行）</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let toastTimer = null;
+
+function toast(message) {
+  const el = $('toast');
+  el.textContent = message;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+}
+
+async function api(pathname, options) {
+  const res = await fetch(pathname, options);
+  const text = await res.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch {}
+  if (!res.ok) throw new Error((data && (data.error || data.ok === false && data.error)) || text.slice(0, 200) || ('HTTP ' + res.status));
+  return data;
+}
+
+function tag(el, ok, text) {
+  el.textContent = text;
+  el.className = 'tag ' + (ok ? 'ok' : 'bad');
+}
+
+async function refresh() {
+  try {
+    const health = await api('/health');
+    tag($('readerTag'), health.reader.connected, health.reader.connected ? 'reader 已连' : 'reader 断开');
+    const hookOk = !!health.hook.account;
+    tag($('hookTag'), hookOk, hookOk ? ('hook ok · ' + health.hook.wechatVersion) : 'hook 未就绪');
+    tag($('pauseTag'), !health.paused, health.paused ? '已暂停' : '转发中');
+    $('btnPause').textContent = health.paused ? '恢复转发' : '暂停转发';
+    const last = health.reader.lastMessageAt ? new Date(health.reader.lastMessageAt).toLocaleString() : '—';
+    $('status').innerHTML = [
+      ['微信账号', health.hook.account || '—'],
+      ['微信版本', health.hook.wechatVersion || '—'],
+      ['reader 地址', health.reader.url],
+      ['hook 地址', health.hook.url],
+      ['最近消息', last],
+      ['DSH 连接数', String(health.clients)],
+      ['运行时长', health.uptimeSec + ' 秒'],
+    ].map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join('');
+  } catch (error) {
+    tag($('readerTag'), false, '服务未响应');
+  }
+}
+
+async function loadConfig() {
+  const cfg = await api('/api/config');
+  $('allow').value = (cfg.allow || []).join('\n');
+  $('cfgPreset').value = cfg.agentPreset || '';
+  $('cfgProvider').value = cfg.provider || '';
+  $('cfgModel').value = cfg.model || '';
+  if (!$('testTalker').value && (cfg.allow || []).length) $('testTalker').value = cfg.allow[0] === '*' ? '' : cfg.allow[0];
+}
+
+async function loadLog() {
+  const res = await fetch('/api/log?lines=200');
+  $('log').textContent = await res.text();
+}
+
+$('btnRefresh').onclick = () => { refresh(); loadLog(); };
+$('btnPause').onclick = async () => {
+  const health = await api('/health');
+  await api('/api/pause', { method: 'POST', body: JSON.stringify({ paused: !health.paused }) });
+  toast(health.paused ? '已恢复转发' : '已暂停转发');
+  refresh();
+};
+$('btnSaveAllow').onclick = async () => {
+  const allow = $('allow').value.split('\n').map(s => s.trim()).filter(Boolean);
+  await api('/api/config', { method: 'POST', body: JSON.stringify({ allow }) });
+  toast('白名单已保存（立即生效）');
+};
+$('btnSessions').onclick = async () => {
+  const data = await api('/api/sessions');
+  const list = data.sessions || data.data || data || [];
+  const rows = Array.isArray(list) ? list.map(s => `${s.username || s.talker || ''}\t${s.displayName || s.name || ''}\t${s.conversationId || ''}`) : [];
+  $('sessions').textContent = rows.join('\n') || JSON.stringify(data).slice(0, 800);
+};
+$('btnTestText').onclick = async () => {
+  try {
+    await api('/send/text', { method: 'POST', body: JSON.stringify({ talker: $('testTalker').value.trim(), text: $('testText').value }) });
+    toast('已发送');
+  } catch (error) { toast('失败：' + error.message); }
+};
+$('btnTestImage').onclick = async () => {
+  try {
+    await api('/send/image', { method: 'POST', body: JSON.stringify({ talker: $('testTalker').value.trim(), path: $('testImage').value.trim() }) });
+    toast('图片已发送');
+  } catch (error) { toast('失败：' + error.message); }
+};
+$('btnSaveAgent').onclick = async () => {
+  await api('/api/config', { method: 'POST', body: JSON.stringify({
+    agentPreset: $('cfgPreset').value.trim(),
+    provider: $('cfgProvider').value.trim(),
+    model: $('cfgModel').value.trim(),
+  }) });
+  toast('已保存，重启 DSH 生效');
+};
+
+refresh();
+loadConfig();
+loadLog();
+setInterval(refresh, 3000);
+setInterval(loadLog, 5000);
+</script>
+</body>
+</html>

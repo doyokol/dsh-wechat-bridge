@@ -1,0 +1,17 @@
+# ============================================================================
+# dsh-wechat-bridge —— DSH bundle patch
+# ============================================================================
+# 让「微信桥接」作为 profile 的一个 bundle 被加载，插件管理页就能看到并开关它。
+# 宿主半区：native-context.mjs（工具 + 会话桥接），客户端半区：client.js（设置页）。
+#
+# 安装（任一）：
+#   dsh plugin --profile desktop add link:D:/APP/AI/DSH-WeChat-Bridge
+#   或手工：profile package.json 的 dependencies 加 link:，bundles 加 dsh-wechat-bridge，
+#           node_modules 里建一个指向本目录的 junction。
+# ============================================================================
+
+- insert:
+    - id: dsh-wechat-bridge
+      name: dsh-wechat-bridge
+      config:
+        agentPreset: standard
