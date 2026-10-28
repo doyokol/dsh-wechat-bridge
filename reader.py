@@ -15,10 +15,12 @@ import hashlib
 import json
 import pathlib
 import queue
+import re
 import sys
 import threading
 import time
 import traceback
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -31,6 +33,34 @@ CONFIG_PATH = ROOT / 'config.json'
 POLL_INTERVAL = 1.0
 HISTORY_LIMIT = 30
 MIME_EXT = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp'}
+
+# 表情包（localType=47）的 XML 属性：md5 / thumburl / cdnurl（属性等号两边可能带空格）
+EMOJI_ATTR = re.compile(r'([A-Za-z][\w:.-]*)\s*=\s*"([^"]*)"')
+# 表情包最大 2MB：再大的多是几百帧动图，截断下载只会得到坏图
+EMOJI_MAX_BYTES = 2 * 1024 * 1024
+
+
+def emoji_parts(raw_text):
+    """从表情包消息的 XML 里取 (md5, 下载地址)。优先 thumburl——它是明文图片。"""
+    attrs = dict(EMOJI_ATTR.findall(raw_text or ''))
+    md5 = (attrs.get('md5') or attrs.get('androidmd5') or '').strip().lower()
+    if len(md5) != 32:
+        md5 = ''
+    url = (attrs.get('thumburl') or attrs.get('cdnurl') or '').strip()
+    return md5, url.replace('&amp;', '&')
+
+
+def sniff_ext(data):
+    if data[:3] == b'GIF':
+        return '.gif'
+    if data[:4] == b'\x89PNG':
+        return '.png'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return '.webp'
+    if data[:3] == b'\xff\xd8\xff':
+        return '.jpg'
+    return ''
+
 
 # 不是真人会话，列白名单时跳过
 SYSTEM_TALKERS = {
@@ -226,6 +256,35 @@ class MediaStore:
             target.write_bytes(data)
             return target
         return None
+
+    def fetch_emoji(self, md5, url):
+        """表情包：本地 cache/*/Emoticon/<md5> 是另一套加密（图片 key 解不开），
+        所以直接按 CDN 地址下载明文图（thumburl 最优）。失败返回 None。"""
+        if md5:
+            for existing in self.out_dir.glob('stk-' + md5 + '.*'):
+                return existing
+        if not url:
+            return None
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+            with urllib.request.urlopen(req, timeout=10) as res:
+                data = res.read(EMOJI_MAX_BYTES + 1)
+        except Exception:
+            return None
+        if not data or len(data) > EMOJI_MAX_BYTES:
+            # 超过上限说明是张几百帧的大动图，截断下载只会得到坏图，宁可不发
+            return None
+        ext = sniff_ext(data)
+        if not ext:
+            return None
+        name = 'stk-' + (md5 or hashlib.md5(data).hexdigest())
+        try:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            target = self.out_dir / (name + ext)
+            target.write_bytes(data)
+            return target
+        except OSError:
+            return None
 
     @staticmethod
     def _decode_source(mod, source, pair):
@@ -423,6 +482,20 @@ class Reader:
                             break
                         time.sleep(1.0 if attempt == 0 else 0.8)
                     content = ('[图片] ' + str(image_path)) if image_path else '[图片]'
+                elif local_type == 47:
+                    # 表情包：本地 Emoticon 缓存是另一套加密，改从 CDN 拉明文图，模型就能真看到
+                    emoji_md5, emoji_url = emoji_parts(row.get('rawText') or '')
+                    sticker_path = None
+                    try:
+                        sticker_path = self.media.fetch_emoji(emoji_md5, emoji_url)
+                    except Exception:
+                        traceback.print_exc()
+                    content = ('[表情包] ' + str(sticker_path)) if sticker_path else '[表情包]'
+                    image_path = sticker_path
+                elif local_type in (244813135921, 34, 25769803825, 81604378673):
+                    # 引用 / 语音 / 文件 / 聊天记录：parsedContent 已经是人话，别整条丢掉
+                    if not content:
+                        continue
                 elif local_type != 1 or not content:
                     continue
                 payload = {

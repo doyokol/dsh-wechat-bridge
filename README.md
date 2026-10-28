@@ -10,7 +10,8 @@ DSH 侧默认用 `standard` 预设，工具不做白名单限制。
 
 - **收发都在自己手里**：reader 读库收消息，hook 直发文本 / 原图 / 表情，不经过任何云端中转
 - **原图不是缩略图**：微信本地同一张图存三份（`_h` 原图 / 中图 / `_t` 缩略图），优先解 `_h`，实测能还原 1920×1080、1080×2740
-- **像人一样聊天**：断句分条发、句末不加句号、自然收尾发表情包、群聊默认潜水（唤醒词/@ 才开口）
+- **像人一样聊天**：一次模型调用就够 —— 正文用空行分段，桥接按段拆成 1–3 条依次发出；句末不加句号、群聊默认潜水（唤醒词/@ 才开口）
+- **表情与正文同一轮**：正文末尾写 `[meme:happy]` 即可，桥接删掉标记、先发文字再补一张真表情，不会为了发表情多跑一轮模型
 - **群聊有记忆**：按群落 `memory/group-<hash>.md`，模型自己往里记群友画像
 - **设置页面板**：DSH 设置 →「微信桥接」，改白名单（可搜名字）、对话节奏、唤醒词、人格卡，点开就能编辑规则文件
 - **思考过程单独留档**：模型的思考段落到 `workspace/thinking.jsonl`，只在面板看，不发微信
@@ -90,7 +91,25 @@ DSH 侧默认用 `standard` 预设，工具不做白名单限制。
 | `turnTimeoutMs` | 单轮超时，`0` = 不限时 |
 | `personaFile` | 群聊人设文件，只在群会话注入 |
 | `maxChars` | 注入 prompt 的最大字符数 |
+| `memeCooldownMinutes` | 发表情的最小间隔（分钟），防止每条都配图 |
+| `memeRoot` | 表情图库根目录（空 = 用插件自带的 `meme-packs`） |
+| `ffmpegPath` | 表情转 GIF 用的 ffmpeg（空 = 自动找 PATH） |
+| `compressOnceUntil` | 毫秒时间戳；设成未来时间 = 临时允许模型调一次 `compress` |
+| `groupSandboxMode` / `privateSandboxMode` | 群 / 私聊的 DSH 沙箱档位 |
 | `paused` | 暂停处理（不删白名单） |
+
+## 回复是怎么发出去的
+
+模型**一轮只跑一次**，最终回复文本回到插件后：
+
+1. `cleanReply()` 剥掉 `[SKIP]`、自我旁白（"I replied to…"）、工具报错行、`Error: unknown tool` 这类泄漏文本
+2. 抽出 `[meme:<mood>]` 标记（有的话）
+3. `splitParagraphs()` 按空行拆成最多 3 条
+4. 逐条 `POST /send/text`（条间停 700ms），最后补发表情
+
+所以**不需要**「发文字」工具：`wechat_send` / `wechat_send_rich` 已移除——它们每调一次都会多跑一整轮模型（实测「发一条→想→再发一条」单轮能拖到 200–300 秒）。现在正文只能写在最终回复里。
+
+剩下能用的是：`wechat_send_image`（发图）、`wechat_send_meme`（只想发纯表情时）、`wechat_memory_append` / `wechat_memory_read`（群聊写本群记忆、私聊写 `MEMORY.md`）、`wechat_stock`（行情）、`wechat_remind`（定时主动找你）。
 
 ## 群聊行为
 
@@ -98,6 +117,7 @@ DSH 侧默认用 `standard` 预设，工具不做白名单限制。
 - 时间距离上次开口不足 `groupGapSeconds` 且没被点名 → 直接跳过
 - 这轮判断不该接话时模型只输出 `[SKIP]`，插件整条丢掉
 - 群里只放只读工具 + 微信工具 + 记忆工具，`bash/write/edit` 之类由 `tools.guard()` 拒掉
+- 群里看不到 `compress`（`tools.restrict({ deny: ['compress'] })`），只在 `compressOnceUntil` 放行时临时开放，且 30 分钟内最多折一次
 - 群会话沙箱 `workspace-write`（只能改 `workspace/`），私聊默认全权限
 
 ## 图片

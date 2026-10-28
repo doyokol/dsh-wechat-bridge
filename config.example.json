@@ -3,18 +3,18 @@
   "hookMode": "native",
   "wechatVersion": "4.1.10.27",
   "hookUrl": "http://127.0.0.1:30002",
-  "hookToken": "<在 runtime/wechat-4.1.10.27/wechatagent-hook.token 里>",
+  "hookToken": "<read from runtime/wechat-4.1.10.27/wechatagent-hook.token>",
   "readerMode": "native",
   "readerUrl": "http://127.0.0.1:17891",
   "readerHost": "127.0.0.1",
   "readerPort": 17891,
-  "pythonPath": "<装有 pycryptodome 的 python.exe>",
+  "pythonPath": "<python.exe with pycryptodome>",
   "dbPath": "C:/Users/<you>/xwechat_files/wxid_xxxxxxxxxxxx_abcd",
   "selfWxid": "wxid_xxxxxxxxxxxx_abcd",
-  "decryptKey": "<32 位 hex，见 README 说明>",
+  "decryptKey": "<32-hex db key, see README>",
   "mediaKey": {
-    "code": 0,
-    "aes": "<16 位字符串，微信重启后 kvcomm 派生不出 key 时用>"
+    "code": 224,
+    "aes": "<16-char ascii or 32-hex, used when kvcomm key files are gone>"
   },
   "workspace": "D:/AI/dsh-wechat-bridge-workspace",
   "serverHost": "127.0.0.1",
@@ -29,6 +29,7 @@
   "model": "deepseek-flash",
   "turnTimeoutMs": 0,
   "maxChars": 18000,
+  "ffmpegPath": "",
   "personaFile": "D:/AI/dsh-wechat-bridge-workspace/persona/example.md",
   "personaVersion": 1,
   "mergeSeconds": 5,
@@ -41,5 +42,9 @@
   "wakeHoldSeconds": 120,
   "rateLimitPerMin": 10,
   "silent": false,
-  "groupSandboxMode": "workspace-write"
+  "groupSandboxMode": "workspace-write",
+  "privateSandboxMode": "danger-full-access",
+  "memeRoot": "",
+  "memeCooldownMinutes": 10,
+  "compressOnceUntil": 0
 }

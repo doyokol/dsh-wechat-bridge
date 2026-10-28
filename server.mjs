@@ -198,8 +198,10 @@ function imageSize(raw, ext) {
 
 const FFMPEG_CANDIDATES = () => [
   cfg.ffmpegPath,
-  'C:/Users/doyokol/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-9.0.2-full_build/bin/ffmpeg.exe',
+  process.env.FFMPEG_PATH,
   'ffmpeg',
+  'ffmpeg.exe',
+  'C:/ffmpeg/bin/ffmpeg.exe',
 ].filter(Boolean);
 
 function findFfmpeg() {
@@ -952,6 +954,7 @@ const server = http.createServer(async (req, res) => {
         wakeHoldSeconds: Number(cfg.wakeHoldSeconds) || 0,
         wakeWords: Array.isArray(cfg.wakeWords) ? cfg.wakeWords : [],
         rateLimitPerMin: Number(cfg.rateLimitPerMin) || 0,
+        memeCooldownMinutes: Number(cfg.memeCooldownMinutes) || 0,
         silent: !!cfg.silent,
         reminders: loadReminders().length,
         reader: { connected: readerConnected, lastMessageAt: readerLastAt, url: cfg.readerUrl },
@@ -1019,7 +1022,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && route === '/api/config') {
       const body = await readBody(req);
       const patch = {};
-      for (const key of ['allow', 'paused', 'proactive', 'mergeSeconds', 'privateMergeSeconds', 'groupGapSeconds', 'wakeHoldSeconds', 'wakeWords', 'rateLimitPerMin', 'silent', 'agentPreset', 'provider', 'model', 'sessionEpoch', 'turnTimeoutMs', 'maxChars', 'dataRoot', 'serverPort', 'personaVersion', 'personaFile', 'hookToken', 'hookUrl', 'hookMode', 'selfWxid', 'wechatVersion', 'mediaKey']) {
+      for (const key of ['allow', 'paused', 'proactive', 'mergeSeconds', 'privateMergeSeconds', 'groupGapSeconds', 'wakeHoldSeconds', 'wakeWords', 'rateLimitPerMin', 'memeCooldownMinutes', 'compressOnceUntil', 'silent', 'agentPreset', 'provider', 'model', 'sessionEpoch', 'turnTimeoutMs', 'maxChars', 'dataRoot', 'serverPort', 'personaVersion', 'personaFile', 'hookToken', 'hookUrl', 'hookMode', 'selfWxid', 'wechatVersion', 'mediaKey']) {
         if (body[key] !== undefined) patch[key] = body[key];
       }
       cfg = patchConfig(patch);

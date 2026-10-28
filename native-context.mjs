@@ -107,7 +107,10 @@ export function apply(ctx, config = {}) {
   // 群聊记忆：助手自己写的笔记（只追加），每轮群聊把最近的记忆贴进 prompt。
   // 存 workspace/memory/ 下，按会话分开，群聊只有这一个写入入口（文件工具在群里被禁掉）。
   const MEMORY_DIR = path.join(workspace, 'memory');
-  const memoryFile = talker => path.join(MEMORY_DIR, 'group-' + crypto.createHash('sha1').update(String(talker)).digest('hex').slice(0, 10) + '.md');
+  // 群聊写各自的 group-<hash>.md；私聊写工作区根目录的 MEMORY.md（和人手写的长期记忆同一份）。
+  const memoryFile = talker => (String(talker).includes('@chatroom')
+    ? path.join(MEMORY_DIR, 'group-' + crypto.createHash('sha1').update(String(talker)).digest('hex').slice(0, 10) + '.md')
+    : path.join(workspace, 'MEMORY.md'));
   const readMemory = talker => {
     try {
       const text = fs.readFileSync(memoryFile(talker), 'utf8');
@@ -179,7 +182,96 @@ export function apply(ctx, config = {}) {
     const isGroup = String(talker).includes('@chatroom');
     // 安装微信工具组：新建会话时在 setup 里跑；会话已经被 DSH 界面打开时（attach）也要补装，
     // 否则那条会话的 agent 里没有 wechat_* 工具，模型会说"发不出图"。
+    // compress 处理：优先直接对 agent 隐藏（tools.restrict），模型连这个工具都看不到，
+    // 就不会每轮白跑一步去调用再被拒（拒绝文案还会漏进聊天）。
+    // 若 restrict 不可用（工具不在可限制名单里），退化成半小时限流的 guard。
+    const COMPRESS_GAP_MS = 30 * 60 * 1000;
+    const lastCompressAt = new Map();
+    const compressGate = exec => {
+      if (String(exec?.name ?? '') !== 'compress') return undefined;
+      // 面板里点了「压缩一次」：允许窗口内放行，压缩完窗口自然过期。
+      if (compressForced()) {
+        log('compress allowed (forced):', sid);
+        lastCompressAt.set(sid, Date.now());
+        return undefined;
+      }
+      const last = lastCompressAt.get(sid) ?? 0;
+      const wait = COMPRESS_GAP_MS - (Date.now() - last);
+      if (wait > 0) {
+        log('compress denied (cooldown):', sid, Math.ceil(wait / 60000) + 'min left');
+        return '刚折过一次，先别折：每次折叠都会让后面的请求缓存失效、反而更慢。除非上下文快到上限或明显变慢，才需要再折一次。';
+      }
+      lastCompressAt.set(sid, Date.now());
+      return undefined;
+    };
+
+    // 记忆工具：群聊私聊都装。群聊写 memory/group-<hash>.md，私聊写工作区根的 MEMORY.md。
+    // 不给这个工具时，模型会直接去 edit MEMORY.md，然后被「file has not been read」挡住报错。
+    const registerMemoryTools = agentCtx => {
+      const disposeMemory = agentCtx.tools.register({
+        name: 'wechat_memory_append',
+        description: '往长期记忆里追加一条笔记（只追加，会一直保留，之后的聊天里会作为「记忆」出现）。适合记：别人的癖好和外号、共同梗、约定、答应过的事、你自己想记住的事。一句话一条，简短。记东西就用这个工具，不要去编辑 MEMORY.md 文件。',
+        parameters: {
+          type: 'object',
+          properties: { note: { type: 'string', description: '要记住的内容，一句话，短一点' } },
+          required: ['note'],
+          additionalProperties: false,
+        },
+        output: {
+          schema: {
+            type: 'object',
+            properties: { ok: { type: 'boolean' }, message: { type: 'string' } },
+            required: ['ok', 'message'],
+            additionalProperties: false,
+          },
+          render: (_args, value) => [{ type: 'text', text: String(value?.message ?? '') }],
+        },
+        async execute(args) {
+          const note = String(args?.note ?? '').trim();
+          if (!note) return { ok: false, message: '需要 note 参数' };
+          try {
+            const count = appendMemory(talker, note);
+            return { ok: true, message: `记住了 ${count} 条。` };
+          } catch (error) {
+            return { ok: false, message: '记不下来：' + ((error && error.message) || String(error)) };
+          }
+        },
+      });
+      if (disposeMemory) handles.set(sid + ':memory', disposeMemory);
+
+      const disposeMemoryRead = agentCtx.tools.register({
+        name: 'wechat_memory_read',
+        description: '把已经记下的长期记忆读出来看看（确认自己的笔记真的写进去了、之前记过谁）。',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+        output: {
+          schema: {
+            type: 'object',
+            properties: { ok: { type: 'boolean' }, text: { type: 'string' } },
+            required: ['ok', 'text'],
+            additionalProperties: false,
+          },
+          render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '') }],
+        },
+        async execute() {
+          const text = readMemory(talker).trim();
+          return { ok: true, text: text || '（还没有任何记忆）' };
+        },
+      });
+      if (disposeMemoryRead) handles.set(sid + ':memory-read', disposeMemoryRead);
+    };
+
     const installTools = agentCtx => {
+      // 先把 compress 从这条会话的工具表里摘掉（群聊私聊都摘）。
+      let compressHidden = false;
+      try {
+        const disposeRestrict = agentCtx.tools.restrict({ deny: ['compress'] });
+        if (disposeRestrict) {
+          handles.set(sid + ':restrict-compress', disposeRestrict);
+          compressHidden = true;
+        }
+      } catch (error) {
+        log('compress restrict unavailable, fall back to cooldown guard:', String(error?.message ?? error));
+      }
       // 群聊限权：命令、终端、写文件这些一律拒掉，只留只读 + 微信相关 + 记忆工具。
       // 私聊保持全权限（agent 默认）。
       if (isGroup) {
@@ -187,64 +279,29 @@ export function apply(ctx, config = {}) {
         // 联网工具（web_search / web_fetch / read_page / x_search / web_reader）必须放行，
         // 否则查行情、看新闻、搜资料全都做不了。
         // 注意 meme-search__search 带连字符，用 /^...|meme/ 兜住。
-        const KEEP = /^(read|glob|grep|list|find|search|web|fetch|x_search|read_page|todo_write|wechat_|meme|skill)/i;
+        // 上下文工具只放行 acp_status（看还剩多少可压）；compress 已在上面被 restrict 掉，
+        // 万一 restrict 没生效，这里还有 compressGate 兜底。
+        const KEEP = /^(read|glob|grep|list|find|search|web|fetch|x_search|read_page|todo_write|wechat_|meme|skill|compress|acp_status)/i;
         const disposeGuard = agentCtx.tools.guard(exec => {
+          if (!compressHidden) {
+            const blocked = compressGate(exec);
+            if (blocked !== undefined) return blocked;
+          }
           const name = String(exec?.name ?? '');
-          if (!name || KEEP.test(name)) return undefined;
+          if (!name) return undefined;
+          if (KEEP.test(name)) return undefined;
           return `群聊里不开放「${name}」工具`;
         });
         if (disposeGuard) handles.set(sid + ':guard', disposeGuard);
 
-        const disposeMemory = agentCtx.tools.register({
-          name: 'wechat_memory_append',
-          description: '往群聊记忆里记一条笔记（只追加，会一直保留并在之后的群聊里作为「群聊记忆」出现）。适合记：群里谁来谁往、谁的癖好和外号、共同梗、约定、答应过的事、你自己想记住的事。一句一条，简短。',
-          parameters: {
-            type: 'object',
-            properties: { note: { type: 'string', description: '要记住的内容，一句话，短一点' } },
-            required: ['note'],
-            additionalProperties: false,
-          },
-          output: {
-            schema: {
-              type: 'object',
-              properties: { ok: { type: 'boolean' }, message: { type: 'string' } },
-              required: ['ok', 'message'],
-              additionalProperties: false,
-            },
-            render: (_args, value) => [{ type: 'text', text: String(value?.message ?? '') }],
-          },
-          async execute(args) {
-            const note = String(args?.note ?? '').trim();
-            if (!note) return { ok: false, message: '需要 note 参数' };
-            try {
-              const count = appendMemory(talker, note);
-              return { ok: true, message: `记住了 ${count} 条。` };
-            } catch (error) {
-              return { ok: false, message: '记不下来：' + ((error && error.message) || String(error)) };
-            }
-          },
-        });
-        if (disposeMemory) handles.set(sid + ':memory', disposeMemory);
-
-        const disposeMemoryRead = agentCtx.tools.register({
-          name: 'wechat_memory_read',
-          description: '把群聊记忆里已经记下的内容读出来看看（确认自己的笔记真的写进去了、之前记过谁）。',
-          parameters: { type: 'object', properties: {}, additionalProperties: false },
-          output: {
-            schema: {
-              type: 'object',
-              properties: { ok: { type: 'boolean' }, text: { type: 'string' } },
-              required: ['ok', 'text'],
-              additionalProperties: false,
-            },
-            render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '') }],
-          },
-          async execute() {
-            const text = readMemory(talker).trim();
-            return { ok: true, text: text || '（还没有任何记忆）' };
-          },
-        });
-        if (disposeMemoryRead) handles.set(sid + ':memory-read', disposeMemoryRead);
+        registerMemoryTools(agentCtx);
+      } else {
+        // 私聊保留全权限；compress 已被 restrict 摘掉，restrict 失败时用同一条限流兜底。
+        if (!compressHidden) {
+          const disposeGuard = agentCtx.tools.guard(compressGate);
+          if (disposeGuard) handles.set(sid + ':guard', disposeGuard);
+        }
+        registerMemoryTools(agentCtx);
       }
 
       const dispose = agentCtx.tools.register({
@@ -309,48 +366,26 @@ export function apply(ctx, config = {}) {
         async execute(args) {
           const mood = String(args?.mood ?? '').trim();
           if (!mood) return { ok: false, mood: '', message: '需要 mood 参数' };
-          try {
-            const result = await serverRequest('/send/meme', { talker, mood, query: String(args?.query ?? '') });
-            const name = String(result?.name ?? '');
-            return { ok: true, mood: String(result?.mood ?? mood), message: '表情包已发到微信' + (name ? '（' + name + '）' : '') };
-          } catch (error) {
-            return { ok: false, mood, message: '表情包发送失败：' + ((error && error.message) || String(error)) };
+          // 一轮只准一张：模型有时候先发一张、想两秒又补一张，用户看到的就是连甩两个表情。
+          if (memeTurn.get(talker)) {
+            log('meme skipped (already sent this turn):', talker);
+            return { ok: true, mood, message: '这一轮已经发过一张表情包了，不要再连发第二张' };
           }
+          // 频率闸：同一个聊天 8 分钟内最多一张，压住「每条回复都配图」。
+          if (!memeAllowed(talker)) {
+            log('meme skipped (cooldown):', talker);
+            return { ok: true, mood, message: '刚发过表情包了，这轮先不发，只用文字回就行' };
+          }
+          const sent = await sendMemeNow(talker, mood, args?.query);
+          if (!sent.ok) return { ok: false, mood, message: '表情包发送失败：' + sent.error };
+          return { ok: true, mood, message: '表情包已发到微信' + (sent.name ? '（' + sent.name + '）' : '') };
         },
       });
       if (disposeMeme) handles.set(sid + ':meme', disposeMeme);
 
-      // 主动发文本：不必等对方先说话，可以自己找对方（比如"看完了，觉得还行"）
-      const disposeSend = agentCtx.tools.register({
-        name: 'wechat_send',
-        description: '主动往当前微信聊天发一条文本消息（不需要对方先说话）。适合想说点什么、或补充一句的时候。',
-        parameters: {
-          type: 'object',
-          properties: { text: { type: 'string', description: '要发送的文本' } },
-          required: ['text'],
-          additionalProperties: false,
-        },
-        output: {
-          schema: {
-            type: 'object',
-            properties: { ok: { type: 'boolean' }, message: { type: 'string' } },
-            required: ['ok', 'message'],
-            additionalProperties: false,
-          },
-          render: (_args, value) => [{ type: 'text', text: String(value?.message ?? '') }],
-        },
-        async execute(args) {
-          if (!args?.text || typeof args.text !== 'string') return { ok: false, message: '需要 text 参数' };
-          if (!proactiveOn()) return { ok: false, message: '主动发送已在「DSH 设置 → 微信桥接」里关闭，不能主动发消息' };
-          try {
-            await sendText(talker, args.text);
-            return { ok: true, message: '已发送到微信' };
-          } catch (error) {
-            return { ok: false, message: '发送失败：' + ((error && error.message) || String(error)) };
-          }
-        },
-      });
-      if (disposeSend) handles.set(sid + ':send', disposeSend);
+      // 发文字的工具（wechat_send / wechat_send_rich）已经下线：
+      // 模型每调一次就要多跑一整轮（40 秒起），于是出现「发一条→想→再发一条」。
+      // 现在正文直接写在最终回复里，发送端按空行拆成最多 3 条；表情用 [meme:tag] 标记。
 
       // 行情：群里没有 shell，跑不了 skill 里的 python 脚本，所以把腾讯行情接口做成原生工具。
       // 私聊/群聊都能用，不依赖 python 和第三方库。
@@ -616,6 +651,21 @@ export function apply(ctx, config = {}) {
   // 当成 assistant 正文写进会话）。以前会被原样转发到微信，用户看到一堆 ❌ [ACP] xxx。
   const FRAMEWORK_ERROR = /(\[ACP\]|stream error|turn degenerated|continuation nudge|turn_error|turn_aborted|model not found|账号已被禁用|api key|unauthorized|rate limit|insufficient|余额不足|context length|maximum context|overloaded|ECONNRESET|ETIMEDOUT)/i;
 
+  // 发完微信之后，模型常把「我刚发了什么」当成正文总结一遍（中英文都有），
+  // 例如「The morning exchange is complete — I replied to … all delivered through the WeChat tools」。
+  // 这类自述一个字都不能进微信。
+  const NARRATION_EN = /(completed (this|the) turn|(all )?replies? (were|have been|was) delivered|delivered (through|via) (the )?wechat|i (have |'ve )?(replied|sent|delivered)|no further action|wechat tools?\b|the morning exchange)/i;
+  const NARRATION_CN = /(本轮(已经)?(完成|结束)|(已经)?(全部)?(发送|回复)(完毕|完成)|通过微信(工具)?(发送|发出)|无需(再|继续)?(回复|发送)|(任务|回复)(已)?完成[，,]?\s*无)/;
+
+  function looksLikeNarration(text) {
+    const raw = String(text ?? '').trim();
+    if (!raw) return false;
+    // 英文自述优先判（它经常夹着中文原话，比如 replied to "被阿唔弄醒了好几次"）
+    if (NARRATION_EN.test(raw)) return true;
+    if (!/[\u4e00-\u9fa5]/.test(raw)) return false;
+    return NARRATION_CN.test(raw);
+  }
+
   // 模型有时候不真去调工具，而是把原生工具调用标记当正文吐出来（而且半角 | 还被写成了全角 ｜）：
   //   <｜｜DSML｜｜tool_calls> / <｜｜DSML｜｜invoke name="wechat_send"> / <｜｜DSML｜｜parameter name="text">
   // 这些残渣以前会被原样发到微信，群友看到的就是 </｜｜DSML｜｜ invoke> 这种东西。
@@ -687,11 +737,18 @@ export function apply(ctx, config = {}) {
     const raw = stripJunk(salvageToolcall(text) || text);
     if (!raw) return null;
     if (SKIP_MARK.test(raw)) return null;
-    const lines = raw.split(/\r?\n/);
+    if (looksLikeNarration(raw)) return null;
+    // 工具报错行不该进聊天：compress 被摘掉后模型会凭印象去调（Error: unknown tool），
+    // 或者绕过记忆工具直接 edit MEMORY.md（Error: cannot modify … file has not been read）。
+    const TOOL_ERROR_LINE = /^\s*(?:Error|错误)\s*[:：]|unknown tool|cannot modify|cannot read|file has not been read|ENOENT|EACCES|EPERM/i;
+    const cleaned = raw.split(/\r?\n/).filter(line => !TOOL_ERROR_LINE.test(line)).join('\n').trim();
+    if (!cleaned) return null;
+    const lines = cleaned.split(/\r?\n/);
     const marked = lines.some(line => SKIP_LINE.test(line.trim()));
-    if (!marked) return raw;
+    if (!marked) return cleaned;
     const kept = lines.filter(line => !SKIP_LINE.test(line.trim()) && !SELF_TALK.test(line));
     const body = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    if (body && looksLikeNarration(body)) return null;
     return body || null;   // 除了标记和内心戏啥也没有 = 这轮不说话
   }
 
@@ -713,6 +770,13 @@ export function apply(ctx, config = {}) {
       .replace(/[ \t]{2,}/g, ' ')
       .trim();
   }
+
+  // 模型在正文末尾写 [meme:happy] 这种标记，发送端就真的发一张对应情绪的图，并把标记删掉。
+  // 这样「文字+表情」只要一次模型往返，不用先发字再补一次工具调用（那要多跑一整轮）。
+  const MEME_MARK = /\[\s*(?:meme|mem|表情包?|sticker)\s*[:：]\s*(happy|angry|sad|shy|confused|daily|开心|生气|难过|害羞|困惑|日常)\s*\]/i;
+  const MEME_MOOD_ALIAS = {
+    开心: 'happy', 生气: 'angry', 难过: 'sad', 害羞: 'shy', 困惑: 'confused', 日常: 'daily',
+  };
 
   // 群聊里叫它一声才醒。默认就是它的名字；面板里可改（一行一个）。
   const DEFAULT_WAKE_WORDS = ['大肥鱼', '本鲸'];
@@ -737,14 +801,76 @@ export function apply(ctx, config = {}) {
       wakeWords: words.length ? words : DEFAULT_WAKE_WORDS,
       rateLimitPerMin: Math.floor(num(stored.rateLimitPerMin ?? cfg.rateLimitPerMin, 0)),
       silent: (stored.silent ?? cfg.silent) === true,
+      memeCooldownMinutes: Math.min(num(stored.memeCooldownMinutes ?? cfg.memeCooldownMinutes, 8), 240),
+      compressOnceUntil: num(stored.compressOnceUntil ?? cfg.compressOnceUntil, 0),
     };
+  }
+
+  // 手动压一次：把 compressOnceUntil 设成未来时间戳，窗口内放行 compress，并提示模型这一轮折一下。
+  function compressForced() {
+    return Date.now() < (settings().compressOnceUntil ?? 0);
+  }
+
+  function compressRuleLine() {
+    return compressForced()
+      ? '上下文：这一轮先用 compress 工具把前面很长的聊天记录压缩一次（调一次就够，别反复调），压缩完再正常回复。'
+      : '上下文：压缩工具（compress）已经关掉了，不要调用它、也不要跟对方提；聊天记录多长都不用你操心，正常聊就行。';
   }
 
   const sentAt = new Map();     // talker -> 最近一分钟的发送时间戳
   const wakeAt = new Map();     // talker -> 最近一次被唤醒（叫到名字）的时间
   const fallbackAt = new Map(); // talker -> 最近一次发「卡了一下」兜底话术的时间
+  const lastMemeAt = new Map(); // talker -> 最近一次真的发出表情包的时间（限频用）
   const FALLBACK_GAP_MS = 10 * 60 * 1000; // 同一个聊天 10 分钟内最多发一次兜底话术
+
+  // 表情包限频：默认同一个聊天 8 分钟内最多一张。她太爱配图了，光靠提示词压不住。
+  function memeAllowed(talker) {
+    const gap = (settings().memeCooldownMinutes ?? 8) * 60 * 1000;
+    if (gap <= 0) return true;
+    return Date.now() - (lastMemeAt.get(talker) ?? 0) >= gap;
+  }
+
+  // 真正发一张表情，成功后记时间；失败把本轮配额退回去。
+  async function sendMemeNow(talker, mood, query) {
+    memeTurn.set(talker, Date.now());
+    try {
+      const result = await serverRequest('/send/meme', { talker, mood, query: String(query ?? '') });
+      lastMemeAt.set(talker, Date.now());
+      return { ok: true, name: String(result?.name ?? '') };
+    } catch (error) {
+      memeTurn.delete(talker);
+      return { ok: false, error: String((error && error.message) || error) };
+    }
+  }
   const buffers = new Map();    // talker -> { items, timer }
+  const recentTalk = new Map(); // talker -> 最近聊过的消息（潜水时也记，叫醒后当上下文）
+  const lastReply = new Map();  // talker -> 最近一次真正发出去的文字
+  const memeTurn = new Map();   // talker -> 本轮已经发过表情包的时间戳（防止一轮连发两张）
+  const RECENT_MAX = 14;        // 最多记 14 条
+  const RECENT_WINDOW_MS = 10 * 60 * 1000; // 只保留最近 10 分钟
+
+  // 群里平时潜水，等有人真的叫它时，它得知道刚才大家在聊什么、发的是什么图，
+  // 否则就会出现「@大肥鱼 如何评价」→ 它回「评价什么呀」这种断片。
+  function rememberTalk(talker, items) {
+    const list = recentTalk.get(talker) ?? [];
+    const fallbackName = String(talker).includes('@chatroom') ? '群友' : '对方';
+    for (const item of items) {
+      list.push({
+        name: item.senderName || item.talkerId || fallbackName,
+        content: String(item.content ?? ''),
+        at: Date.now(),
+      });
+    }
+    const cutoff = Date.now() - RECENT_WINDOW_MS;
+    const kept = list.filter(x => x.at >= cutoff).slice(-RECENT_MAX);
+    recentTalk.set(talker, kept);
+    return kept;
+  }
+
+  function talkHistory(talker) {
+    const cutoff = Date.now() - RECENT_WINDOW_MS;
+    return (recentTalk.get(talker) ?? []).filter(x => x.at >= cutoff);
+  }
 
   function recentSends(talker) {
     const now = Date.now();
@@ -764,8 +890,12 @@ export function apply(ctx, config = {}) {
   const GROUP_QUIET_RULE = '群里的规矩：默认潜水。只有这几种情况才说话——①有人 @ 你、叫你的名字、直接问你；②有人问了一个真需要答案的问题；③有人接着你上一句在说、在等你回。除此之外一律只输出 [SKIP]：别人之间互相接梗、发图发表情、复述结论、聊游戏战况、互相打趣、感叹两句，统统不需要你插嘴。别对每条消息都表态，别把每句话都当在跟你说话。';
   const NO_THINKING_RULE = 'RESPOND: 冒号之后只写要发到微信的那句话本身：不要写判断过程、不要写「这是 X 在跟 Y 说话」「不是叫我」「跟我无关」「我先看看」这类分析——判断在 RESPOND 之前想完就行，冒号后面直接是聊天内容。';
   const OUT_RULE = '输出格式：要发的话必须单独开一行，以「RESPOND:」开头，冒号后面就是会发到微信的正文（想分条就用空行分段）。RESPOND 之前的任何内容都被当成思考丢掉，不会发出去。这轮不打算说话就只输出一行 [SKIP]。';
+  // 已经用 wechat_send 发过话的轮次，模型最后一步爱写一段「我发了什么、发给了谁」的总结。
+  const NO_NARRATION_RULE = '如果你这一轮已经用 wechat_send / wechat_send_image / wechat_send_meme 把话发出去了，最后一步只输出一行 [SKIP]，不要总结「我发了什么」「本轮完成」「已通过微信工具发送」这类话——那不是聊天内容，发出去对方会看到一段莫名其妙的独白。';
+  // 分条方式：一次写完让系统拆，比反复调 wechat_send 快得多（每次调用都要重跑一遍模型）。
+  const SPLIT_RULE = '分条方式：想发 2-3 条就把每段用空行隔开、一次写完，系统会自动拆成几条依次发出去。不要为了分条反复调用 wechat_send——每调一次都要重跑一遍模型，对方要等十几秒才看到下一条。wechat_send 只用于发图片、文件，或者确实要精确控制某一条。';
 
-  function buildPrompt(items, cell, talker) {
+  function buildPrompt(items, cell, talker, history = []) {
     const first = items[0] ?? {};
     const group = first.sessionType === 'group';
     const parts = [];
@@ -778,11 +908,13 @@ export function apply(ctx, config = {}) {
         cell.personaVersion = version;
       }
       parts.push('群聊要点：默认一到两行、口语、不要 emoji 堆砌、不要 Markdown；发图用 wechat_send_meme。');
-      parts.push('发表情只能用 wechat_send_meme 工具；绝对不要写 [表情: xxx] 或 [STICKER:xxx] 这类占位文字——微信里它就是一串字，不是图。');
+      parts.push('正文直接写，系统会按空行自动拆成最多 3 条发出去（已经没有「发文字」的工具了，别去找 wechat_send）。想配表情就在正文最后另起一行写 [meme:happy]（tag 取 happy/angry/sad/shy/confused/daily，写中文情绪也行），系统会发一张真表情并把那一行删掉；表情别每条都发，十次里有那么一两次就够。绝对不要写 [表情: xxx] 或 [STICKER:xxx] 这类占位文字——微信里它就是一串字，不是图。');
       parts.push('你的文字回复会被按空行拆成 2-3 条依次发出，所以想连发几条就用空行分段，每段一到两行。');
+      parts.push(SPLIT_RULE);
       parts.push(NO_THINKING_RULE);
       parts.push(OUT_RULE);
       parts.push('你在群里没有命令、终端和写文件的权限，只有只读工具 + 微信工具 + 记忆工具，别答应去做本机操作。');
+      parts.push(compressRuleLine());
       parts.push('长期记忆用 wechat_memory_append 写（一句话一条，也可以一次写多行=多条），会一直保留、以后每次群聊都附在下面。值得记的：每个群友是谁、外号、说话风格和脾气、工作/生活里提过的事、共同梗、约定、答应过的事。有人聊到关于自己的新信息（换了工作、在忙什么、爱好），就顺手记一条画像；不确定记没记过，用 wechat_memory_read 先看一眼。不要问「要不要我记下来」，直接记。');
       const memory = readMemory(talker);
       if (memory.trim()) parts.push('群聊记忆（你自己之前记的）：\n' + memory.trim());
@@ -795,6 +927,12 @@ export function apply(ctx, config = {}) {
       }
       parts.push(SKIP_RULE);
       parts.push(GROUP_QUIET_RULE);
+      parts.push(NO_NARRATION_RULE);
+      if (history.length) {
+        parts.push('群里刚才在说这些（你潜水，没回，只是看过了）：');
+        for (const past of history.slice(-10)) parts.push(`[${past.name}] ${past.content}`);
+        parts.push('——上面这些只是背景，别逐条回，也别总结它们；只看这一轮该接什么。有人发过图片（形如 [图片] D:\\...），需要看内容就用 read_image 打开那个路径。');
+      }
       parts.push('微信消息·微信群「' + (first.groupName || '') + '」：');
       for (const item of items) {
         const who = item.senderName || item.talkerId || '群友';
@@ -816,10 +954,14 @@ export function apply(ctx, config = {}) {
         if (mem) parts.push('以下是本鲸的长期记忆（MEMORY.md），聊天时自然带出，别逐条念：\n' + mem);
         cell.guidelinesVersion = gv;
       }
-      parts.push('发表情只能用 wechat_send_meme 工具；绝对不要写 [表情: xxx] 或 [STICKER:xxx] 这类占位文字——微信里它就是一串字，不是图。');
+      parts.push('正文直接写，系统会按空行自动拆成最多 3 条发出去（已经没有「发文字」的工具了，别去找 wechat_send）。想配表情就在正文最后另起一行写 [meme:happy]（tag 取 happy/angry/sad/shy/confused/daily，写中文情绪也行），系统会发一张真表情并把那一行删掉；表情别每条都发，十次里有那么一两次就够。绝对不要写 [表情: xxx] 或 [STICKER:xxx] 这类占位文字——微信里它就是一串字，不是图。');
+      parts.push(SPLIT_RULE);
       parts.push(NO_THINKING_RULE);
       parts.push(OUT_RULE);
       parts.push(SKIP_RULE);
+      parts.push(NO_NARRATION_RULE);
+      parts.push(compressRuleLine());
+      parts.push('要记东西就用 wechat_memory_append（只追加、不会坏文件）；不要直接去编辑 MEMORY.md 或别的文件——文件工具要求先读后写，很容易报「file has not been read」，而且那行报错会漏到你眼前。');
       parts.push('微信私聊，对方说：');
       for (const item of items) parts.push(String(item.content ?? ''));
     }
@@ -830,6 +972,10 @@ export function apply(ctx, config = {}) {
   async function handle(talker, items) {
     try {
       const conf = settings();
+      // 先把这批消息之前的上下文取出来，再把本批记进去：潜水时也记，被叫醒时不至于断片。
+      const history = talkHistory(talker);
+      rememberTalk(talker, items);
+      memeTurn.delete(talker);   // 新一轮，表情包配额重置
       const limit = conf.rateLimitPerMin;
       if (limit > 0 && recentSends(talker).length >= limit) {
         log('rate limited:', talker, 'limit', limit, '/min');
@@ -854,9 +1000,12 @@ export function apply(ctx, config = {}) {
           return;
         }
         // 冷却：被点名时立刻回；只是刚才被叫醒、没再点名，就至少隔 groupGapSeconds 再开口
+        // 例外：这批里有图片，或者它刚问过对方一句（等人家回答），就别拿冷却把人挡掉。
         if (!hit && conf.groupGapSeconds > 0) {
+          const hasImage = texts.some(text => /\[图片\]|\[表情包\]/.test(text));
+          const askedBack = /[?？]\s*$/.test(String(lastReply.get(talker) ?? ''));
           const lastAt = Math.max(0, ...(sentAt.get(talker) ?? [0]));
-          if (Date.now() - lastAt < conf.groupGapSeconds * 1000) {
+          if (!hasImage && !askedBack && Date.now() - lastAt < conf.groupGapSeconds * 1000) {
             log('group gap skip:', talker, 'gap', conf.groupGapSeconds + 's', 'idle', Math.round((Date.now() - lastAt) / 1000) + 's');
             return;
           }
@@ -864,15 +1013,19 @@ export function apply(ctx, config = {}) {
       }
       log('message:', talker, 'x' + items.length, String(items[0]?.content ?? '').slice(0, 60));
       const cell = await ensureAgent(talker);
-      const prompt = buildPrompt(items, cell, talker);
+      const prompt = buildPrompt(items, cell, talker, history);
       log('ask ->', cell.sid, 'initialized:', cell.initialized, 'merged:', items.length);
       const reply = await ask(talker, prompt);
       cell.initialized = true;
       const raw = String(reply ?? '').trim();
       const split = splitReply(raw);
-      const text = stripMarkers(cleanReply(split.reply) ?? '');
+      const cleaned = stripMarkers(cleanReply(split.reply) ?? '');
+      // 正文末尾的 [meme:happy] 由发送端处理：删掉标记，文字发完再补一张真表情。
+      const memeHit = cleaned.match(MEME_MARK);
+      const wantMood = memeHit ? String(MEME_MOOD_ALIAS[memeHit[1]] ?? memeHit[1]).toLowerCase() : '';
+      const text = wantMood ? cleaned.replace(MEME_MARK, '').replace(/\n{3,}/g, '\n\n').trim() : cleaned;
       recordThinking(talker, split.think, text);
-      if (!text) {
+      if (!text && !wantMood) {
         log('skipped (nothing to send):', cell.sid, JSON.stringify(raw.slice(0, 80)));
         return;
       }
@@ -891,6 +1044,15 @@ export function apply(ctx, config = {}) {
         if (i < chunks.length - 1) await new Promise(done => setTimeout(done, 700));
       }
       recordSend(talker);
+      lastReply.set(talker, chunks[chunks.length - 1] ?? text);
+      if (wantMood) {
+        if (memeAllowed(talker)) {
+          const sentMeme = await sendMemeNow(talker, wantMood, '');
+          log('meme marker:', talker, wantMood, sentMeme.ok ? (sentMeme.name || 'ok') : 'failed: ' + sentMeme.error);
+        } else {
+          log('meme marker skipped (cooldown):', talker, wantMood);
+        }
+      }
     } catch (error) {
       const message = String(error?.message ?? error);
       log('turn failed:', message);
@@ -937,9 +1099,10 @@ export function apply(ctx, config = {}) {
       enqueue(talker, () => handle(talker, [payload]));
       return;
     }
-    const slot = buffers.get(talker) ?? { items: [], timer: null, firstAt: 0 };
+    const slot = buffers.get(talker) ?? { items: [], timer: null, firstAt: 0, lastAt: 0 };
     slot.items.push(payload);
-    if (!slot.firstAt) slot.firstAt = Date.now();
+    slot.lastAt = Date.now();
+    if (!slot.firstAt) slot.firstAt = slot.lastAt;
 
     // 正在思考：先攒着，等这轮结束后由 flushAfterTurn 一起发
     if (runningTurns.has(talker)) {
@@ -969,12 +1132,18 @@ export function apply(ctx, config = {}) {
         await handle(talker, items);
       } finally {
         runningTurns.delete(talker);
-        // 思考期间又攒了消息：稍等一下再合并成下一轮，别立刻追一条
+        // 思考期间又攒了消息：等一个「安静窗口」再合并成下一轮。
+        // 以前固定 800ms 就开火，用户还在连着打字，于是每条消息各开一轮、一条一条回。
         const left = buffers.get(talker);
         if (left && left.items.length && !left.timer) {
-          left.firstAt = left.firstAt || Date.now();
-          left.timer = setTimeout(() => flushBuffer(talker), 800);
+          const { window, maxWait } = mergeWindow(talker);
+          const now = Date.now();
+          const quiet = Math.max(2500, Math.min(window * 1000, (left.lastAt || now) + window * 1000 - now));
+          const wait = Math.max(0, Math.min(quiet, (left.firstAt || now) + maxWait - now));
+          left.firstAt = left.firstAt || now;
+          left.timer = setTimeout(() => flushBuffer(talker), wait);
           buffers.set(talker, left);
+          log('merge hold:', talker, left.items.length + ' 条', 'wait ' + Math.round(wait / 1000) + 's');
         }
       }
     });
@@ -1000,9 +1169,12 @@ export function apply(ctx, config = {}) {
       cell.initialized = true;
       const rawWake = String(reply ?? '').trim();
       const wakeSplit = splitReply(rawWake);
-      const text = stripMarkers(cleanReply(wakeSplit.reply) ?? '');
+      const wakeCleaned = stripMarkers(cleanReply(wakeSplit.reply) ?? '');
+      const wakeMemeHit = wakeCleaned.match(MEME_MARK);
+      const wakeMood = wakeMemeHit ? String(MEME_MOOD_ALIAS[wakeMemeHit[1]] ?? wakeMemeHit[1]).toLowerCase() : '';
+      const text = wakeMood ? wakeCleaned.replace(MEME_MARK, '').replace(/\n{3,}/g, '\n\n').trim() : wakeCleaned;
       recordThinking(talker, wakeSplit.think, text);
-      if (!text) { log('wake skipped (nothing to send):', cell.sid); return; }
+      if (!text && !wakeMood) { log('wake skipped (nothing to send):', cell.sid); return; }
       if (FRAMEWORK_ERROR.test(text) && text.length < 400) { log('wake skipped (framework error text):', cell.sid); return; }
       if (settings().silent) { log('silent mode, wake reply kept local:', cell.sid, JSON.stringify(text.slice(0, 120))); return; }
       log('wake reply <-', cell.sid, JSON.stringify(text.slice(0, 120)));
@@ -1012,6 +1184,10 @@ export function apply(ctx, config = {}) {
         if (i < wakeChunks.length - 1) await new Promise(done => setTimeout(done, 700));
       }
       recordSend(talker);
+      if (wakeMood && memeAllowed(talker)) {
+        const sentWakeMeme = await sendMemeNow(talker, wakeMood, '');
+        log('wake meme marker:', talker, wakeMood, sentWakeMeme.ok ? (sentWakeMeme.name || 'ok') : 'failed: ' + sentWakeMeme.error);
+      }
     } catch (error) {
       log('wake failed:', error?.message ?? String(error));
     }
@@ -1098,6 +1274,9 @@ export function apply(ctx, config = {}) {
     for (const slot of buffers.values()) { try { clearTimeout(slot.timer); } catch {} }
     buffers.clear();
     runningTurns.clear();
+    recentTalk.clear();
+    lastReply.clear();
+    memeTurn.clear();
     for (const cleanup of cleanups) { try { cleanup(); } catch {} }
     for (const item of pending.values()) { clearTimeout(item.timer); item.reject(new Error('plugin_stopped')); }
     pending.clear();
